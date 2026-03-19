@@ -76,16 +76,52 @@ def connect_arduino(baud=9600):
         return None
 
 
-def send_to_arduino(ser, fingers_up):
+def calc_finger_bend(landmarks):
     """
-    Отправляет состояние пальцев на Arduino.
-    Формат: "0:1,1:0,2:1,3:0,4:1\n"
-    Палец 0=большой, 1=указательный, 2=средний, 3=безымянный, 4=мизинец
-    Состояние: 1=поднят, 0=опущен
+    Вычисляет степень сгиба 4 пальцев (указательный, средний, безымянный, мизинец).
+    Возвращает список из 4 значений PWM (0-255).
+    0 = палец разогнут, 255 = палец полностью согнут к ладони.
+    """
+    import math
+
+    wrist = landmarks[0]  # Запястье — база для расчёта
+
+    # MCP суставы (основание пальцев) и кончики для 4 пальцев
+    finger_mcps = [5, 9, 13, 17]   # index, middle, ring, pinky MCP
+    finger_tips = [8, 12, 16, 20]  # index, middle, ring, pinky TIP
+
+    pwm_values = []
+    for mcp_idx, tip_idx in zip(finger_mcps, finger_tips):
+        mcp = landmarks[mcp_idx]
+        tip = landmarks[tip_idx]
+
+        # Расстояние от MCP до кончика (когда разогнут — максимум)
+        max_dist = math.sqrt((mcp.x - wrist.x)**2 + (mcp.y - wrist.y)**2)
+        tip_dist = math.sqrt((tip.x - mcp.x)**2 + (tip.y - mcp.y)**2)
+
+        # Нормализуем: разогнут=0, согнут=255
+        if max_dist > 0:
+            ratio = tip_dist / max_dist
+            # ratio ~1.0 = разогнут, ~0.0 = согнут
+            ratio = max(0.0, min(1.0, ratio))
+            pwm = int((1.0 - ratio) * 255)
+        else:
+            pwm = 0
+
+        pwm_values.append(max(0, min(255, pwm)))
+
+    return pwm_values
+
+
+def send_to_arduino(ser, pwm_values):
+    """
+    Отправляет PWM значения на Arduino.
+    Формат: "V1,V2,V3,V4\n" (0-255 для каждого из 4 пальцев)
+    Порядок: указательный, средний, безымянный, мизинец
     """
     if ser is None:
         return
-    msg = ",".join(f"{i}:{int(v)}" for i, v in enumerate(fingers_up))
+    msg = ",".join(str(v) for v in pwm_values)
     try:
         ser.write((msg + "\n").encode())
     except serial.SerialException:
@@ -245,8 +281,9 @@ def main():
                 gesture = get_gesture(fingers_up)
                 total_up = sum(fingers_up)
 
-                # Отправляем на Arduino
-                send_to_arduino(arduino, fingers_up)
+                # Вычисляем сгиб и отправляем PWM на Arduino
+                pwm_values = calc_finger_bend(hand_lms)
+                send_to_arduino(arduino, pwm_values)
 
                 # Bounding box
                 x_coords = [lm.x for lm in hand_lms]
