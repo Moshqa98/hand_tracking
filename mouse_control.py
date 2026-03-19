@@ -1,16 +1,18 @@
 """
-Управление мышью жестами руки через веб-камеру.
+Управление компьютером жестами руки через веб-камеру.
 Использует MediaPipe Tasks API (0.10.30+).
 
 Установка зависимостей:
-    pip install opencv-python mediapipe pyautogui
+    pip install opencv-python mediapipe pyautogui pycaw comtypes
 
 Жесты:
-    Указательный палец вверх        — двигать курсор
-    Указательный + большой сжать    — левый клик (ЛКМ)
-    Указательный + средний вверх    — правый клик (ПКМ)
-    Кулак                           — ничего (пауза)
-    Ладонь (все пальцы)             — скролл (двигай вверх/вниз)
+    Указательный палец вверх              — двигать курсор
+    Щипок (большой + указательный)        — левый клик (ЛКМ)
+    Двойной щипок (2 быстрых)             — двойной клик
+    Указательный + средний вверх          — правый клик (ПКМ)
+    Ладонь раскрыта + поворот влево/вправо — Alt+Tab переключение окон
+    Кулак + расстояние большой-указательный — громкость (вместе=0%, врозь=100%)
+    Кулак (без движения)                  — пауза
 
 Управление:
     Q или ESC — выход
@@ -26,17 +28,35 @@ import urllib.request
 import os
 import math
 
-# Отключаем failsafe pyautogui (иначе в углу экрана крашится)
+# Громкость через pycaw (Windows)
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    devices = AudioUtilities.GetSpeakers()
+    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    volume_ctrl = cast(interface, POINTER(IAudioEndpointVolume))
+    VOL_MIN, VOL_MAX, _ = volume_ctrl.GetVolumeRange()
+    HAS_PYCAW = True
+    print(f"Pycaw: громкость {VOL_MIN:.0f}..{VOL_MAX:.0f} dB")
+except Exception as e:
+    HAS_PYCAW = False
+    volume_ctrl = None
+    print(f"Pycaw недоступен ({e}), громкость через клавиши.")
+
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 
 # Landmark indices
 WRIST = 0
 THUMB_TIP = 4
+THUMB_MCP = 2
 INDEX_TIP = 8
 INDEX_PIP = 6
+INDEX_MCP = 5
 MIDDLE_TIP = 12
 MIDDLE_PIP = 10
+MIDDLE_MCP = 9
 RING_TIP = 16
 RING_PIP = 14
 PINKY_TIP = 20
@@ -44,13 +64,15 @@ PINKY_PIP = 18
 
 # Настройки
 SCREEN_W, SCREEN_H = pyautogui.size()
-SMOOTHING = 5          # Сглаживание движения (чем больше, тем плавнее)
-CLICK_DIST = 0.04      # Порог расстояния для щипка (thumb-index)
-SCROLL_SPEED = 15       # Скорость скролла
+SMOOTHING = 5
+CLICK_DIST = 0.04
+DOUBLE_CLICK_TIME = 0.4   # Макс время между двумя щипками для двойного клика
+PALM_ROTATE_THRESH = 15   # Градусы поворота ладони для Alt+Tab
+VOL_DIST_MIN = 0.03       # Мин расстояние (пальцы вместе)
+VOL_DIST_MAX = 0.20       # Макс расстояние (пальцы врозь)
 
 
 def download_model():
-    """Скачивает модель hand_landmarker если её нет."""
     model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
     if not os.path.exists(model_path):
         url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
@@ -60,47 +82,77 @@ def download_model():
     return model_path
 
 
-def distance(p1, p2):
-    """Расстояние между двумя landmarks."""
+def dist(p1, p2):
     return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
 
 
 def is_finger_up(landmarks, tip_idx, pip_idx):
-    """Проверяет, поднят ли палец."""
     return landmarks[tip_idx].y < landmarks[pip_idx].y
+
+
+def get_palm_angle(landmarks):
+    """Угол наклона ладони (градусы). 0 = вертикально, +/- = наклон."""
+    wrist = landmarks[WRIST]
+    middle_mcp = landmarks[MIDDLE_MCP]
+    dx = middle_mcp.x - wrist.x
+    dy = middle_mcp.y - wrist.y
+    angle = math.degrees(math.atan2(dx, -dy))
+    return angle
+
+
+def set_volume(level):
+    """Устанавливает громкость 0.0..1.0"""
+    level = max(0.0, min(1.0, level))
+    if HAS_PYCAW and volume_ctrl:
+        vol_db = VOL_MIN + level * (VOL_MAX - VOL_MIN)
+        volume_ctrl.SetMasterVolumeLevel(vol_db, None)
+
+
+def get_volume():
+    """Текущая громкость 0.0..1.0"""
+    if HAS_PYCAW and volume_ctrl:
+        current = volume_ctrl.GetMasterVolumeLevel()
+        if VOL_MAX != VOL_MIN:
+            return (current - VOL_MIN) / (VOL_MAX - VOL_MIN)
+    return 0.5
 
 
 def get_mode(landmarks):
     """
-    Определяет режим по жестам:
-    'move'   — только указательный вверх (двигаем курсор)
-    'lclick' — большой и указательный сжаты (щипок)
-    'rclick' — указательный + средний вверх
-    'scroll' — все 5 пальцев вверх (ладонь)
-    'idle'   — кулак или неопределённо
+    Определяет режим:
+    'move'    — только указательный вверх
+    'pinch'   — большой + указательный сжаты
+    'rclick'  — указательный + средний вверх
+    'palm'    — все пальцы вверх (переключение окон)
+    'volume'  — кулак (средний, безымянный, мизинец согнуты) — громкость по расстоянию thumb-index
+    'idle'    — неопределённо
     """
     index_up = is_finger_up(landmarks, INDEX_TIP, INDEX_PIP)
     middle_up = is_finger_up(landmarks, MIDDLE_TIP, MIDDLE_PIP)
     ring_up = is_finger_up(landmarks, RING_TIP, RING_PIP)
     pinky_up = is_finger_up(landmarks, PINKY_TIP, PINKY_PIP)
 
-    thumb_index_dist = distance(landmarks[THUMB_TIP], landmarks[INDEX_TIP])
+    thumb_index = dist(landmarks[THUMB_TIP], landmarks[INDEX_TIP])
 
-    # Щипок — ЛКМ
-    if thumb_index_dist < CLICK_DIST and index_up:
-        return 'lclick'
+    # Щипок
+    if thumb_index < CLICK_DIST:
+        return 'pinch'
+
+    # Все пальцы — ладонь (Alt+Tab)
+    if index_up and middle_up and ring_up and pinky_up:
+        return 'palm'
 
     # Указательный + средний — ПКМ
     if index_up and middle_up and not ring_up and not pinky_up:
         return 'rclick'
 
-    # Все пальцы вверх — скролл
-    if index_up and middle_up and ring_up and pinky_up:
-        return 'scroll'
-
     # Только указательный — движение
     if index_up and not middle_up and not ring_up and not pinky_up:
         return 'move'
+
+    # Все основные согнуты — режим громкости
+    if not index_up and not middle_up and not ring_up and not pinky_up:
+        return 'volume'
 
     return 'idle'
 
@@ -134,23 +186,33 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    print("Камера запущена. Управляйте мышью жестами!")
-    print("Указательный — двигать | Щипок — ЛКМ | Два пальца — ПКМ | Ладонь — скролл")
+    print("Камера запущена!")
+    print("Указательный=курсор | Щипок=клик | 2xЩипок=двойной клик")
+    print("2 пальца=ПКМ | Ладонь+поворот=Alt+Tab | Кулак=громкость")
     print("Q / ESC — выход")
 
     prev_time = time.time()
     timestamp = 0
 
-    # Сглаживание курсора
+    # Курсор
     smooth_x = SCREEN_W // 2
     smooth_y = SCREEN_H // 2
 
-    # Состояния кликов (чтобы не спамить)
-    lclick_done = False
+    # Клики
+    pinch_done = False
+    pinch_released_time = 0.0
+    pinch_count = 0
+    click_pending = False
+    click_pending_time = 0.0
     rclick_done = False
 
-    # Для скролла — запоминаем предыдущую Y позицию
-    scroll_prev_y = None
+    # Alt+Tab
+    alt_tab_active = False
+    palm_prev_angle = None
+    last_tab_time = 0.0
+
+    # Громкость
+    current_vol = get_volume()
 
     while True:
         ret, frame = cap.read()
@@ -171,27 +233,25 @@ def main():
 
         result = detection_result[0]
         mode = 'idle'
+        vol_display = None
 
         if result and result.hand_landmarks:
             landmarks = result.hand_landmarks[0]
             mode = get_mode(landmarks)
 
-            # Позиция указательного пальца
             index_x = landmarks[INDEX_TIP].x
             index_y = landmarks[INDEX_TIP].y
 
-            # Рисуем точки на кадре
+            # Рисуем руку
             for lm in landmarks:
                 px, py = int(lm.x * w), int(lm.y * h)
                 cv2.circle(frame, (px, py), 3, (0, 255, 0), -1)
 
-            # Рисуем кончик указательного крупнее
             ix, iy = int(index_x * w), int(index_y * h)
             cv2.circle(frame, (ix, iy), 10, (255, 0, 255), -1)
 
+            # === ДВИЖЕНИЕ КУРСОРА ===
             if mode == 'move':
-                # Маппим координаты пальца на экран
-                # Зона управления — центральная часть кадра (чтобы не тянуться к краям)
                 margin = 0.15
                 norm_x = (index_x - margin) / (1.0 - 2 * margin)
                 norm_y = (index_y - margin) / (1.0 - 2 * margin)
@@ -201,57 +261,142 @@ def main():
                 target_x = int(norm_x * SCREEN_W)
                 target_y = int(norm_y * SCREEN_H)
 
-                # Сглаживание
                 smooth_x += (target_x - smooth_x) / SMOOTHING
                 smooth_y += (target_y - smooth_y) / SMOOTHING
-
                 pyautogui.moveTo(int(smooth_x), int(smooth_y))
 
-                lclick_done = False
+                pinch_done = False
                 rclick_done = False
-                scroll_prev_y = None
+                palm_prev_angle = None
+                if alt_tab_active:
+                    pyautogui.keyUp('alt')
+                    alt_tab_active = False
 
-            elif mode == 'lclick':
-                if not lclick_done:
-                    pyautogui.click()
-                    lclick_done = True
+            # === ЩИПОК / ДВОЙНОЙ КЛИК ===
+            elif mode == 'pinch':
+                if not pinch_done:
+                    pinch_done = True
+                    now = time.time()
+
+                    if pinch_count == 1 and (now - pinch_released_time) < DOUBLE_CLICK_TIME:
+                        # Двойной клик
+                        pyautogui.doubleClick()
+                        pinch_count = 0
+                        click_pending = False
+                    else:
+                        pinch_count = 1
+                        click_pending = True
+                        click_pending_time = now
+
                 rclick_done = False
-                scroll_prev_y = None
+                palm_prev_angle = None
 
+            # === ПКМ ===
             elif mode == 'rclick':
                 if not rclick_done:
                     pyautogui.rightClick()
                     rclick_done = True
-                lclick_done = False
-                scroll_prev_y = None
+                pinch_done = False
+                palm_prev_angle = None
+                if alt_tab_active:
+                    pyautogui.keyUp('alt')
+                    alt_tab_active = False
 
-            elif mode == 'scroll':
-                if scroll_prev_y is not None:
-                    delta = scroll_prev_y - index_y
-                    if abs(delta) > 0.005:
-                        pyautogui.scroll(int(delta * SCROLL_SPEED * 100))
-                scroll_prev_y = index_y
-                lclick_done = False
+            # === ЛАДОНЬ — ALT+TAB ===
+            elif mode == 'palm':
+                angle = get_palm_angle(landmarks)
+
+                if palm_prev_angle is not None:
+                    delta = angle - palm_prev_angle
+                    now = time.time()
+
+                    if abs(delta) > PALM_ROTATE_THRESH and (now - last_tab_time) > 0.5:
+                        if not alt_tab_active:
+                            pyautogui.keyDown('alt')
+                            alt_tab_active = True
+
+                        if delta > 0:
+                            pyautogui.press('tab')
+                        else:
+                            pyautogui.hotkey('shift', 'tab')
+
+                        last_tab_time = now
+                        palm_prev_angle = angle
+                else:
+                    palm_prev_angle = angle
+
+                pinch_done = False
                 rclick_done = False
 
+            # === КУЛАК — ГРОМКОСТЬ ===
+            elif mode == 'volume':
+                thumb_index = dist(landmarks[THUMB_TIP], landmarks[INDEX_TIP])
+
+                # Маппим расстояние на 0..1
+                vol_level = (thumb_index - VOL_DIST_MIN) / (VOL_DIST_MAX - VOL_DIST_MIN)
+                vol_level = max(0.0, min(1.0, vol_level))
+
+                set_volume(vol_level)
+                current_vol = vol_level
+                vol_display = vol_level
+
+                # Рисуем линию thumb-index
+                tx, ty = int(landmarks[THUMB_TIP].x * w), int(landmarks[THUMB_TIP].y * h)
+                cv2.line(frame, (tx, ty), (ix, iy), (0, 255, 255), 3)
+
+                pinch_done = False
+                rclick_done = False
+                palm_prev_angle = None
+                if alt_tab_active:
+                    pyautogui.keyUp('alt')
+                    alt_tab_active = False
+
+            # === IDLE ===
             else:
-                lclick_done = False
+                pinch_done = False
                 rclick_done = False
-                scroll_prev_y = None
+                palm_prev_angle = None
+                if alt_tab_active:
+                    pyautogui.keyUp('alt')
+                    alt_tab_active = False
 
-        # Отображение на экране
+            # Обработка отложенного одиночного клика
+            if click_pending and not pinch_done:
+                now = time.time()
+                if (now - click_pending_time) > DOUBLE_CLICK_TIME:
+                    pyautogui.click()
+                    click_pending = False
+                    pinch_count = 0
+
+            # Запоминаем время отпускания щипка
+            if mode != 'pinch' and pinch_done:
+                pinch_released_time = time.time()
+                pinch_done = False
+
+        else:
+            # Нет руки — сбрасываем всё
+            pinch_done = False
+            rclick_done = False
+            palm_prev_angle = None
+            if alt_tab_active:
+                pyautogui.keyUp('alt')
+                alt_tab_active = False
+
+        # === ОТРИСОВКА UI ===
         mode_colors = {
             'move': (0, 255, 0),
-            'lclick': (0, 0, 255),
+            'pinch': (0, 0, 255),
             'rclick': (255, 0, 0),
-            'scroll': (255, 255, 0),
+            'palm': (255, 165, 0),
+            'volume': (0, 255, 255),
             'idle': (128, 128, 128),
         }
         mode_names = {
             'move': 'MOVE',
-            'lclick': 'LEFT CLICK',
+            'pinch': 'CLICK',
             'rclick': 'RIGHT CLICK',
-            'scroll': 'SCROLL',
+            'palm': 'ALT+TAB',
+            'volume': 'VOLUME',
             'idle': 'IDLE',
         }
 
@@ -261,21 +406,41 @@ def main():
         cv2.putText(frame, mode_names.get(mode, ''), (10, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
 
-        # Подсказки
-        cv2.putText(frame, "Index up = Move", (10, h - 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-        cv2.putText(frame, "Pinch = LClick", (10, h - 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-        cv2.putText(frame, "Index+Middle = RClick", (10, h - 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-        cv2.putText(frame, "Palm = Scroll", (10, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        # Полоска громкости
+        vol_bar_x = w - 40
+        vol_bar_h = h - 100
+        vol_bar_y = 50
+        cv2.rectangle(frame, (vol_bar_x, vol_bar_y), (vol_bar_x + 20, vol_bar_y + vol_bar_h),
+                      (80, 80, 80), 2)
+        filled_h = int(current_vol * vol_bar_h)
+        cv2.rectangle(frame, (vol_bar_x, vol_bar_y + vol_bar_h - filled_h),
+                      (vol_bar_x + 20, vol_bar_y + vol_bar_h),
+                      (0, 255, 255), -1)
+        cv2.putText(frame, f"{int(current_vol * 100)}%", (vol_bar_x - 15, vol_bar_y + vol_bar_h + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(frame, "VOL", (vol_bar_x - 5, vol_bar_y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        cv2.imshow("Mouse Control", frame)
+        # Подсказки
+        hints = [
+            "Index = Move cursor",
+            "Pinch = Click (2x = DblClick)",
+            "Index+Middle = Right Click",
+            "Open Palm + Rotate = Alt+Tab",
+            "Fist = Volume (thumb-index dist)",
+        ]
+        for i, hint in enumerate(hints):
+            cv2.putText(frame, hint, (10, h - 20 - i * 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        cv2.imshow("Hand Control", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             break
+
+    if alt_tab_active:
+        pyautogui.keyUp('alt')
 
     cap.release()
     cv2.destroyAllWindows()
