@@ -3,7 +3,7 @@
 Использует MediaPipe Tasks API (0.10.30+).
 
 Установка зависимостей:
-    pip install opencv-python mediapipe
+    pip install opencv-python mediapipe pyserial
 
 Управление:
     Q или ESC — выход
@@ -16,6 +16,8 @@ from mediapipe.tasks.python import vision
 import time
 import urllib.request
 import os
+import serial
+import serial.tools.list_ports
 
 
 # Landmark indices
@@ -43,6 +45,51 @@ HAND_CONNECTIONS = [
     (0, 17), (17, 18), (18, 19), (19, 20), # Pinky
     (5, 9), (9, 13), (13, 17),             # Palm
 ]
+
+
+def find_arduino():
+    """Автоматически находит COM-порт Arduino."""
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        desc = port.description.lower()
+        if any(k in desc for k in ["arduino", "ch340", "cp210", "usb serial", "usb-serial"]):
+            return port.device
+    # Если не нашли по описанию, вернуть первый доступный
+    if ports:
+        return ports[0].device
+    return None
+
+
+def connect_arduino(baud=9600):
+    """Подключается к Arduino. Возвращает serial объект или None."""
+    port = find_arduino()
+    if port is None:
+        print("Arduino не найдена. Работаю без Arduino.")
+        return None
+    try:
+        ser = serial.Serial(port, baud, timeout=1)
+        time.sleep(2)  # Ждём перезагрузку Arduino
+        print(f"Arduino подключена: {port} @ {baud}")
+        return ser
+    except serial.SerialException as e:
+        print(f"Ошибка подключения к {port}: {e}")
+        return None
+
+
+def send_to_arduino(ser, fingers_up):
+    """
+    Отправляет состояние пальцев на Arduino.
+    Формат: "0:1,1:0,2:1,3:0,4:1\n"
+    Палец 0=большой, 1=указательный, 2=средний, 3=безымянный, 4=мизинец
+    Состояние: 1=поднят, 0=опущен
+    """
+    if ser is None:
+        return
+    msg = ",".join(f"{i}:{int(v)}" for i, v in enumerate(fingers_up))
+    try:
+        ser.write((msg + "\n").encode())
+    except serial.SerialException:
+        pass
 
 
 def download_model():
@@ -140,6 +187,9 @@ def main():
 
     detector = vision.HandLandmarker.create_from_options(options)
 
+    # Подключение к Arduino
+    arduino = connect_arduino()
+
     # Захват видео
     cap = cv2.VideoCapture(0)
 
@@ -195,6 +245,9 @@ def main():
                 gesture = get_gesture(fingers_up)
                 total_up = sum(fingers_up)
 
+                # Отправляем на Arduino
+                send_to_arduino(arduino, fingers_up)
+
                 # Bounding box
                 x_coords = [lm.x for lm in hand_lms]
                 y_coords = [lm.y for lm in hand_lms]
@@ -240,6 +293,8 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     detector.close()
+    if arduino:
+        arduino.close()
     print("Завершено.")
 
 
